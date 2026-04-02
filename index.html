@@ -31,75 +31,24 @@ const SB_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsIn
 const REST_HEADERS = {
   apikey: SB_ANON, Authorization: `Bearer ${SB_ANON}`,
   "Content-Type": "application/json",
-  "Accept-Profile": "orthoquiz", "Content-Profile": "orthoquiz",
 };
 
-const sb = async (path, opts={}) => {
-  const method = opts.method || "GET";
-  const prefer = opts.headers?.Prefer || (method === "POST" ? "return=representation" : "return=minimal");
+// Todas as operações usam RPC (funções security definer no Supabase)
+// Isso contorna completamente o problema de schema orthoquiz não exposto via REST
+const rpc = async (fn, params={}) => {
   try {
-    const r = await fetch(`${SB_URL}/rest/v1/${path}`, {
-      method,
-      headers: { ...REST_HEADERS, Prefer: prefer },
-      body: opts.body || undefined,
-    });
-    if (method === "DELETE" || prefer === "return=minimal") return { ok: true };
-    return await r.json();
-  } catch(e) { return { error: e.message }; }
-};
-
-const sbAuth = async (email, password) => {
-  try {
-    const r = await fetch(`${SB_URL}/auth/v1/token?grant_type=password`, {
+    const r = await fetch(`${SB_URL}/rest/v1/rpc/${fn}`, {
       method: "POST",
-      headers: { apikey: SB_ANON, "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password }),
+      headers: { ...REST_HEADERS, Prefer: "return=representation" },
+      body: JSON.stringify(params),
     });
-    return await r.json();
-  } catch(e) { return { error: e.message }; }
-};
-
-const sbSignup = async (email, password) => {
-  try {
-    const resp = await fetch(`${SB_URL}/auth/v1/signup`, {
-      method: "POST",
-      headers: { apikey: SB_ANON, "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password }),
-    });
-    const data = await resp.json();
-    if (data.error) {
-      const msg = typeof data.error === "string" ? data.error
-        : data.error.message || data.error.msg || JSON.stringify(data.error);
-      return { error: msg };
-    }
-    if (!resp.ok && data.msg) return { error: data.msg };
+    const data = await r.json().catch(()=>(r.ok?[]:{error:r.status}));
+    if (!r.ok) return { error: data?.message || data?.error || r.status };
     return data;
   } catch(e) { return { error: e.message }; }
 };
 
-const sbRecover = async (email) => {
-  try {
-    const r = await fetch(`${SB_URL}/auth/v1/recover`, {
-      method: "POST",
-      headers: { apikey: SB_ANON, "Content-Type": "application/json" },
-      body: JSON.stringify({ email }),
-    });
-    return r.ok ? { ok: true } : { error: "Erro ao enviar email." };
-  } catch(e) { return { error: e.message }; }
-};
-
-const sbUpdatePwd = async (token, password) => {
-  try {
-    const r = await fetch(`${SB_URL}/auth/v1/user`, {
-      method: "PUT",
-      headers: { apikey: SB_ANON, Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ password }),
-    });
-    const d = await r.json();
-    return d.error ? { error: d.error.message || "Erro." } : { ok: true };
-  } catch(e) { return { error: e.message }; }
-};
-
+// ─── USER DATA via RPC ────────────────────────────────────────────────────────
 // ─── AUTH HELPERS ─────────────────────────────────────────────────────────────
 async function signUp(email, senha, nome, ra) {
   // 1. Criar auth user
@@ -124,15 +73,15 @@ async function signUp(email, senha, nome, ra) {
     return { error: "Este email já foi cadastrado mas ainda não confirmado. Verifique sua caixa de email ou use outro endereço." };
   }
 
-  // 2. Inserir perfil
+  // 2. Inserir perfil via RPC (SECURITY DEFINER — bypass RLS/view restrictions)
   const isAdmin = email === ADMIN_EMAIL;
-  const p = await sb("profiles", {
-    method: "POST",
-    body: JSON.stringify({ id: userId, email, nome, ra, is_admin: isAdmin, aprovado: isAdmin })
+  await rpc("oq_insert_profile", {
+    p_id: userId, p_email: email, p_nome: nome, p_ra: ra,
+    p_is_admin: isAdmin, p_aprovado: isAdmin
   });
 
-  // 3. Init XP
-  await sb("user_xp", { method: "POST", body: JSON.stringify({ user_id: userId }) });
+  // 3. Init XP via RPC
+  await rpc("oq_insert_user_xp", { p_user_id: userId });
 
   // Se tem confirmation_sent_at mas não tem access_token = confirmação de email ativa
   const precisaConfirmar = !r.access_token && (r.confirmation_sent_at || r.aud === "authenticated");
@@ -161,8 +110,8 @@ async function signIn(email, senha) {
   // Admin: retorna perfil fixo sem precisar de query
   if (email === ADMIN_EMAIL) return { token: authResp.access_token, profile: ADMIN_PROFILE };
 
-  // Outros usuários: busca perfil via proxy
-  const profiles = await sb(`profiles?email=eq.${encodeURIComponent(email)}&select=*`);
+  // Outros usuários: busca perfil via RPC
+  const profiles = await rpc("oq_get_profile_by_email", { p_email: email });
   if (!Array.isArray(profiles) || profiles.length === 0) return { error: "Perfil não encontrado. Entre em contato com o administrador." };
   const profile = profiles[0];
   if (!profile.aprovado) return { error: "Cadastro pendente de aprovação pelo administrador." };
@@ -183,7 +132,7 @@ const setUserToken = (t) => { _userToken = t; };
 
 async function fetchQuestions() {
   try {
-    const d = await sb("questions?select=*&limit=600");
+    const d = await rpc("oq_get_questions", {});
     return Array.isArray(d) && d.length > 0 ? d : null;
   } catch { return null; }
 }
@@ -191,83 +140,74 @@ async function fetchQuestions() {
 // ─── USER DATA via SUPABASE ───────────────────────────────────────────────────
 async function loadUserData(userId) {
   const [xpRows, progRows, sessRows] = await Promise.all([
-    sb(`user_xp?user_id=eq.${userId}&select=*`),
-    sb(`user_progress?user_id=eq.${userId}&select=*`),
-    sb(`sessions?user_id=eq.${userId}&select=*&order=created_at.desc&limit=50`)
+    rpc("oq_get_user_xp", { p_user_id: userId }),
+    rpc("oq_get_user_progress", { p_user_id: userId }),
+    rpc("oq_get_sessions", { p_user_id: userId })
   ]);
   return {
-    xp:   Array.isArray(xpRows)   && xpRows.length   ? xpRows[0]   : { xp:0, streak:0, last_date:'' },
-    prog: Array.isArray(progRows)  ? progRows  : [],
-    hist: Array.isArray(sessRows)  ? sessRows  : []
+    xp:   Array.isArray(xpRows)  && xpRows.length  ? xpRows[0]  : { xp:0, streak:0, last_date:'' },
+    prog: Array.isArray(progRows) ? progRows : [],
+    hist: Array.isArray(sessRows) ? sessRows : []
   };
 }
 
 async function saveSession(userId, mode, tema, dif, acertos, total, xpGained) {
-  await sb("sessions", {
-    method: "POST",
-    body: JSON.stringify({ user_id: userId, mode, tema, dificuldade: dif, acertos, total, xp_gained: xpGained })
-  });
+  await rpc("oq_save_session", { p_user_id: userId, p_mode: mode, p_tema: tema, p_dif: dif, p_acertos: acertos, p_total: total, p_xp: xpGained });
 }
 
 async function saveXP(userId, xp, streak, lastDate) {
-  await sb(`user_xp?user_id=eq.${userId}`, {
-    method: "PATCH",
-    body: JSON.stringify({ xp, streak, last_date: lastDate, updated_at: new Date().toISOString() })
-  });
+  await rpc("oq_save_xp", { p_user_id: userId, p_xp: xp, p_streak: streak, p_last_date: lastDate });
 }
 
 async function saveProgress(userId, tema, dif, status, acertos) {
-  await sb(`user_progress?user_id=eq.${userId}&tema=eq.${encodeURIComponent(tema)}&dificuldade=eq.${encodeURIComponent(dif)}`, {
-    method: "PATCH",
-    body: JSON.stringify({ status, acertos_acumulados: acertos, updated_at: new Date().toISOString() })
-  });
+  await rpc("oq_upsert_progress", { p_user_id: userId, p_tema: tema, p_dif: dif, p_status: status, p_acertos: acertos });
 }
 
 async function upsertProgress(userId, tema, dif, status, acertos) {
-  await sb("user_progress", {
-    method: "POST",
-    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-    body: JSON.stringify({ user_id: userId, tema, dificuldade: dif, status, acertos_acumulados: acertos })
-  });
+  await rpc("oq_upsert_progress", { p_user_id: userId, p_tema: tema, p_dif: dif, p_status: status, p_acertos: acertos });
 }
 
 async function saveAnswer(userId, sessionId, questionId, tema, subtema, dif, correta) {
-  await sb("question_answers", {
-    method: "POST",
-    body: JSON.stringify({ user_id: userId, session_id: sessionId, question_id: questionId,
-                           tema, subtema, dificuldade: dif, correta })
-  });
+  // question_answers via REST direto (view pública oq_question_answers)
+  try {
+    await fetch(`${SB_URL}/rest/v1/oq_question_answers`, {
+      method: "POST",
+      headers: { ...REST_HEADERS, Prefer: "return=minimal" },
+      body: JSON.stringify({ user_id: userId, session_id: sessionId, question_id: questionId,
+                             tema, subtema, dificuldade: dif, correta })
+    });
+  } catch(e) {}
 }
 
 // ─── ADMIN HELPERS ────────────────────────────────────────────────────────────
 async function fetchAllProfiles() {
-  return sb("profiles?is_admin=eq.false&select=*&order=created_at.desc");
+  return rpc("oq_get_all_profiles", {});
 }
 
 async function approveUser(id) {
-  return sb(`profiles?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ aprovado: true }) });
+  return rpc("oq_approve_user", { p_id: id });
 }
 
 async function deleteUser(id) {
-  await sb(`profiles?id=eq.${id}`, { method: "DELETE", body: "{}" });
+  await rpc("oq_delete_user", { p_id: id });
 }
 
 async function fetchAdminStats() {
   const [users, sessions, answers] = await Promise.all([
-    sb("profiles?is_admin=eq.false&select=id,nome,email,ra,aprovado,created_at"),
-    sb("sessions?select=user_id,tema,dificuldade,acertos,total,created_at&limit=5000"),
-    sb("question_answers?select=user_id,tema,question_id,correta&limit=10000")
+    rpc("oq_get_all_profiles", {}),
+    rpc("oq_get_all_sessions", {}),
+    rpc("oq_get_all_answers", {})
   ]);
   return { users, sessions, answers };
 }
 
 async function fetchUserDetail(userId) {
-  const [xp, prog, sess, answers] = await Promise.all([
-    sb(`user_xp?user_id=eq.${userId}&select=*`),
-    sb(`user_progress?user_id=eq.${userId}&select=*`),
-    sb(`sessions?user_id=eq.${userId}&select=*&order=created_at.desc&limit=100`),
-    sb(`question_answers?user_id=eq.${userId}&select=tema,correta&limit=2000`)
+  const [xp, prog, sess] = await Promise.all([
+    rpc("oq_get_user_xp", { p_user_id: userId }),
+    rpc("oq_get_user_progress", { p_user_id: userId }),
+    rpc("oq_get_user_detail_sessions", { p_user_id: userId })
   ]);
+  const answers = [];
   return {
     xp:      Array.isArray(xp)   && xp.length   ? xp[0]   : { xp:0, streak:0 },
     prog:    Array.isArray(prog)  ? prog  : [],
@@ -961,7 +901,6 @@ function LoginScreen({ onLogin }) {
     setLoad(true); setErr(""); setMsg("");
     const r = await signUp(email.trim().toLowerCase(), senha, nome.trim(), ra.trim());
     setLoad(false);
-    console.log("[DEBUG signup response]", JSON.stringify(r));
     if (r.error) { setErr(r.error); return; }
     if (r.precisaConfirmar) {
       setMsg("Cadastro realizado! Verifique seu email e clique no link de confirmação antes de fazer login.");
