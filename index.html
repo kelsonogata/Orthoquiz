@@ -48,7 +48,59 @@ const rpc = async (fn, params={}) => {
   } catch(e) { return { error: e.message }; }
 };
 
-// ─── USER DATA via RPC ────────────────────────────────────────────────────────
+// ─── AUTH via Supabase Auth API (não usa schema orthoquiz) ──────────────────
+const sbAuth = async (email, password) => {
+  try {
+    const r = await fetch(`${SB_URL}/auth/v1/token?grant_type=password`, {
+      method: "POST",
+      headers: { apikey: SB_ANON, "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    return await r.json();
+  } catch(e) { return { error: e.message }; }
+};
+
+const sbSignup = async (email, password) => {
+  try {
+    const resp = await fetch(`${SB_URL}/auth/v1/signup`, {
+      method: "POST",
+      headers: { apikey: SB_ANON, "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await resp.json();
+    if (data.error) {
+      const msg = typeof data.error === "string" ? data.error
+        : data.error.message || data.error.msg || JSON.stringify(data.error);
+      return { error: msg };
+    }
+    if (!resp.ok && data.msg) return { error: data.msg };
+    return data;
+  } catch(e) { return { error: e.message }; }
+};
+
+const sbRecover = async (email) => {
+  try {
+    const r = await fetch(`${SB_URL}/auth/v1/recover`, {
+      method: "POST",
+      headers: { apikey: SB_ANON, "Content-Type": "application/json" },
+      body: JSON.stringify({ email }),
+    });
+    return r.ok ? { ok: true } : { error: "Erro ao enviar email." };
+  } catch(e) { return { error: e.message }; }
+};
+
+const sbUpdatePwd = async (token, password) => {
+  try {
+    const r = await fetch(`${SB_URL}/auth/v1/user`, {
+      method: "PUT",
+      headers: { apikey: SB_ANON, Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ password }),
+    });
+    const d = await r.json();
+    return d.error ? { error: d.error.message || "Erro." } : { ok: true };
+  } catch(e) { return { error: e.message }; }
+};
+
 // ─── AUTH HELPERS ─────────────────────────────────────────────────────────────
 async function signUp(email, senha, nome, ra) {
   // 1. Criar auth user
