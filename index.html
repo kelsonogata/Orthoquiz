@@ -98,19 +98,21 @@ async function signUp(email, senha, nome, ra) {
   // 1. Criar auth user via proxy
   const r = await sbSignup(email, senha);
   if (r.error) return { error: typeof r.error === "string" ? r.error : "Erro no cadastro. Email já cadastrado?" };
-  if (!r.user?.id) return { error: "Erro ao criar usuário. Tente novamente." };
+  // Supabase pode retornar o user em r.user.id ou diretamente em r.id
+  const userId = r.user?.id || r.id;
+  if (!userId) return { error: "Erro ao criar usuário. Tente novamente." };
 
   // 2. Inserir perfil via proxy
   const isAdmin = email === ADMIN_EMAIL;
   const p = await sb("profiles", {
     method: "POST",
-    body: JSON.stringify({ id: r.user.id, email, nome, ra, is_admin: isAdmin, aprovado: isAdmin })
+    body: JSON.stringify({ id: userId, email, nome, ra, is_admin: isAdmin, aprovado: isAdmin })
   });
 
   // 3. Init XP
-  await sb("user_xp", { method: "POST", body: JSON.stringify({ user_id: r.user.id }) });
+  await sb("user_xp", { method: "POST", body: JSON.stringify({ user_id: userId }) });
 
-  return { user: r.user, profile: Array.isArray(p) ? p[0] : (p || { email, nome, ra }) };
+  return { user: r.user || r, profile: Array.isArray(p) ? p[0] : (p || { email, nome, ra }) };
 }
 
 // Perfil admin fixo — evita dependência do proxy para busca
@@ -1497,6 +1499,7 @@ function OrthoQuizGame({ profile, onLogout }){
   const [simAns,setSimAns] = useState([]);
   const [simRev,setSimRev] = useState(null);
   const [selTema,setSelTema]= useState(null);
+  const [aleAns,setAleAns] = useState([]);
 
   // Carregar dados do usuário do Supabase ao montar
   useEffect(()=>{
@@ -1563,7 +1566,7 @@ function OrthoQuizGame({ profile, onLogout }){
   const startAleatorio=useCallback(()=>{
     const pool=[...allQ].sort(()=>Math.random()-.5);
     setQMode("aleatorio");setQTema(null);setQDif(null);setFila([...pool,...pool,...pool]);setQTotal(0);
-    setQIdx(0);setSel(null);setConf(false);setElim([]);setSHits(0);setSDone(0);setSc("quiz");
+    setQIdx(0);setSel(null);setConf(false);setElim([]);setSHits(0);setSDone(0);setAleAns([]);setSc("quiz");
   },[allQ]);
 
   const startSimulado=useCallback(()=>{
@@ -1595,7 +1598,42 @@ function OrthoQuizGame({ profile, onLogout }){
     const q=fila[qIdx],ok=sel===q.correta;
     let nf=[...fila];
     if(!ok&&qMode!=="aleatorio")nf=[...nf,{...q}];
-    if(qMode==="aleatorio"){setQIdx(i=>i+1);setSel(null);setConf(false);setElim([]);return;}
+    if(qMode==="aleatorio"){
+      // Registrar resposta no histórico do modo aleatório
+      const novaResp={tema:q.tema,dif:q.dificuldade,ok};
+      const novasAleAns=[...aleAns,novaResp];
+      setAleAns(novasAleAns);
+      // A cada 10 respostas, salvar sessões agrupadas por tema
+      if(novasAleAns.length>0 && novasAleAns.length%10===0){
+        if(uid){
+          // Agrupar as últimas 10 por tema e salvar
+          const ultimas=novasAleAns.slice(-10);
+          const porTema={};
+          ultimas.forEach(r=>{
+            if(!porTema[r.tema])porTema[r.tema]={acertos:0,total:0};
+            porTema[r.tema].total++;
+            if(r.ok)porTema[r.tema].acertos++;
+          });
+          Object.entries(porTema).forEach(([tema,dados])=>{
+            saveSession(uid,"aleatorio",tema,"misto",dados.acertos,dados.total,0);
+          });
+        }
+        // Atualizar hist local agrupado por tema
+        const ultimas=novasAleAns.slice(-10);
+        const porTemaLocal={};
+        ultimas.forEach(r=>{
+          if(!porTemaLocal[r.tema])porTemaLocal[r.tema]={acertos:0,total:0};
+          porTemaLocal[r.tema].total++;
+          if(r.ok)porTemaLocal[r.tema].acertos++;
+        });
+        const novasSessoes=Object.entries(porTemaLocal).map(([tema,dados])=>({
+          data:new Date().toLocaleDateString("pt-BR"),tema,dif:"misto",mode:"aleatorio",
+          acertos:dados.acertos,total:dados.total
+        }));
+        sHist([...novasSessoes,...hist].slice(0,50));
+      }
+      setQIdx(i=>i+1);setSel(null);setConf(false);setElim([]);return;
+    }
     if(qIdx+1>=nf.length)finEst(sHits+(ok?1:0));
     else{setFila(nf);setQIdx(i=>i+1);setSel(null);setConf(false);setElim([]);}
   };
@@ -1742,7 +1780,7 @@ function OrthoQuizGame({ profile, onLogout }){
                   <span style={{fontSize:12,fontWeight:700,color:pct>=70?"#10b981":cfg.cor}}>{pct}%</span>
                 </div>
                 <Bar pct={pct} cor={pct>=100?"#10b981":cfg.cor} h={4}/>
-                <p style={{margin:"6px 0 0",fontSize:11,color:MT}}>{h}/{tot} questões corretas no total</p>
+                <p style={{margin:"6px 0 0",fontSize:11,color:MT}}>{sessT.reduce((a,hs)=>a+hs.acertos,0)}/{sessT.reduce((a,hs)=>a+hs.total,0)} questões corretas no total</p>
               </div>
             </div>);
           })}
@@ -1829,13 +1867,27 @@ function OrthoQuizGame({ profile, onLogout }){
         <div style={{padding:"22px 20px 0"}}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
             <button onClick={()=>{
-  // Salvar o que foi feito até agora ao sair
-  if(sDone>0&&uid){
-    const modeLabel=qMode==="aleatorio"?"aleatorio":qMode==="simulado"?"simulado":"estudo";
+  if(qMode==="aleatorio"&&aleAns.length>0&&uid){
+    // Salvar por tema agrupado ao sair do modo aleatório
+    const porTema={};
+    aleAns.forEach(r=>{
+      if(!porTema[r.tema])porTema[r.tema]={acertos:0,total:0};
+      porTema[r.tema].total++;
+      if(r.ok)porTema[r.tema].acertos++;
+    });
+    Object.entries(porTema).forEach(([tema,dados])=>{
+      saveSession(uid,"aleatorio",tema,"misto",dados.acertos,dados.total,0);
+    });
+    const novasSessoes=Object.entries(porTema).map(([tema,dados])=>({
+      data:new Date().toLocaleDateString("pt-BR"),tema,dif:"misto",mode:"aleatorio",
+      acertos:dados.acertos,total:dados.total
+    }));
+    sHist([...novasSessoes,...hist].slice(0,50));
+  } else if(sDone>0&&uid&&qMode!=="aleatorio"){
+    const modeLabel=qMode==="simulado"?"simulado":"estudo";
     const temaLabel=qTema||"Misto";
     const difLabel=qDif||"misto";
     saveSession(uid,modeLabel,temaLabel,difLabel,sHits,sDone,0);
-    // Atualizar progresso parcial no modo estudo
     if(qMode==="estudo"&&qTema&&qDif){
       upsertProgress(uid,qTema,qDif,prog[qTema]?.[qDif]||"desbloqueado",sHits);
     }
