@@ -61,12 +61,19 @@ const sbAuth = async (email, password) => {
 
 const sbSignup = async (email, password) => {
   try {
-    const r = await fetch(`${SB_URL}/auth/v1/signup`, {
+    const resp = await fetch(`${SB_URL}/auth/v1/signup`, {
       method: "POST",
       headers: { apikey: SB_ANON, "Content-Type": "application/json" },
       body: JSON.stringify({ email, password }),
     });
-    return await r.json();
+    const data = await resp.json();
+    if (data.error) {
+      const msg = typeof data.error === "string" ? data.error
+        : data.error.message || data.error.msg || JSON.stringify(data.error);
+      return { error: msg };
+    }
+    if (!resp.ok && data.msg) return { error: data.msg };
+    return data;
   } catch(e) { return { error: e.message }; }
 };
 
@@ -95,14 +102,29 @@ const sbUpdatePwd = async (token, password) => {
 
 // ─── AUTH HELPERS ─────────────────────────────────────────────────────────────
 async function signUp(email, senha, nome, ra) {
-  // 1. Criar auth user via proxy
+  // 1. Criar auth user
   const r = await sbSignup(email, senha);
-  if (r.error) return { error: typeof r.error === "string" ? r.error : "Erro no cadastro. Email já cadastrado?" };
-  // Supabase pode retornar o user em r.user.id ou diretamente em r.id
-  const userId = r.user?.id || r.id;
-  if (!userId) return { error: "Erro ao criar usuário. Tente novamente." };
 
-  // 2. Inserir perfil via proxy
+  // Erro explícito retornado pelo Supabase
+  if (r.error) {
+    const msg = r.error.toLowerCase();
+    if (msg.includes("already registered") || msg.includes("already exists") || msg.includes("duplicate"))
+      return { error: "Este email já está cadastrado. Use outro ou faça login." };
+    return { error: r.error };
+  }
+
+  // Supabase retorna o userId em formatos diferentes conforme email confirmation config:
+  // - Confirmação OFF: { user: { id: "..." }, access_token: "..." }
+  // - Confirmação ON:  { id: "...", aud: "authenticated", ... }
+  // - Email já registrado pendente: {} (objeto vazio — tratar como já existente)
+  const userId = r.user?.id || r.id;
+
+  if (!userId) {
+    // Objeto vazio = email já cadastrado aguardando confirmação
+    return { error: "Este email já foi cadastrado mas ainda não confirmado. Verifique sua caixa de email ou use outro endereço." };
+  }
+
+  // 2. Inserir perfil
   const isAdmin = email === ADMIN_EMAIL;
   const p = await sb("profiles", {
     method: "POST",
@@ -112,7 +134,13 @@ async function signUp(email, senha, nome, ra) {
   // 3. Init XP
   await sb("user_xp", { method: "POST", body: JSON.stringify({ user_id: userId }) });
 
-  return { user: r.user || r, profile: Array.isArray(p) ? p[0] : (p || { email, nome, ra }) };
+  // Se tem confirmation_sent_at mas não tem access_token = confirmação de email ativa
+  const precisaConfirmar = !r.access_token && (r.confirmation_sent_at || r.aud === "authenticated");
+  return {
+    user: r.user || r,
+    profile: Array.isArray(p) ? p[0] : (p || { email, nome, ra }),
+    precisaConfirmar
+  };
 }
 
 // Perfil admin fixo — evita dependência do proxy para busca
@@ -933,8 +961,13 @@ function LoginScreen({ onLogin }) {
     setLoad(true); setErr(""); setMsg("");
     const r = await signUp(email.trim().toLowerCase(), senha, nome.trim(), ra.trim());
     setLoad(false);
-    if (r.error) { setErr(typeof r.error === 'string' ? r.error : "Erro no cadastro."); return; }
-    setMsg("Cadastro realizado! Aguarde aprovação do administrador.");
+    console.log("[DEBUG signup response]", JSON.stringify(r));
+    if (r.error) { setErr(r.error); return; }
+    if (r.precisaConfirmar) {
+      setMsg("Cadastro realizado! Verifique seu email e clique no link de confirmação antes de fazer login.");
+    } else {
+      setMsg("Cadastro realizado! Aguarde aprovação do administrador.");
+    }
     setTab("login");
   };
 
