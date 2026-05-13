@@ -65,15 +65,22 @@ const sbSignup = async (email, password) => {
     const resp = await fetch(`${SB_URL}/auth/v1/signup`, {
       method: "POST",
       headers: { apikey: SB_ANON, "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password }),
+      // data: { email_confirm: false } suprime o envio de email de confirmação
+      body: JSON.stringify({ email, password, data: { email_confirm: false } }),
     });
     const data = await resp.json();
     if (data.error) {
       const msg = typeof data.error === "string" ? data.error
         : data.error.message || data.error.msg || JSON.stringify(data.error);
+      // Traduzir erros comuns para português
+      if (msg.toLowerCase().includes("rate limit")) return { error: "Muitas tentativas. Aguarde alguns minutos e tente novamente." };
+      if (msg.toLowerCase().includes("already registered")) return { error: "Este email já está cadastrado." };
       return { error: msg };
     }
-    if (!resp.ok && data.msg) return { error: data.msg };
+    if (!resp.ok && data.msg) {
+      if (data.msg.toLowerCase().includes("rate limit")) return { error: "Muitas tentativas. Aguarde alguns minutos e tente novamente." };
+      return { error: data.msg };
+    }
     return data;
   } catch(e) { return { error: e.message }; }
 };
