@@ -116,7 +116,7 @@ async function signUp(email, senha, nome, ra) {
   const userId = r.user?.id || r.id;
   if (!userId) return { error: "Não foi possível criar o usuário. Tente novamente." };
 
-  // 2. Auto-confirmar email via Edge Function (dispensa link de email)
+  // 2. Auto-confirmar email via Edge Function
   try {
     await fetch(`${SB_URL}/functions/v1/auto-confirm`, {
       method: "POST",
@@ -125,30 +125,26 @@ async function signUp(email, senha, nome, ra) {
     });
   } catch(e) {}
 
-  // 3. Inserir perfil via RPC
+  // 3. Inserir perfil SEMPRE com aprovado=true (aprovação automática permanente)
   const isAdmin = email === ADMIN_EMAIL;
   await rpc("oq_insert_profile", {
     p_id: userId, p_email: email, p_nome: nome, p_ra: ra,
-    p_is_admin: isAdmin, p_aprovado: isAdmin
+    p_is_admin: isAdmin, p_aprovado: true
   });
 
   // 4. Init XP via RPC
   await rpc("oq_insert_user_xp", { p_user_id: userId });
 
-  // 5. Até 15/05/2026: aprovar automaticamente e logar direto
-  const deadline = new Date("2026-05-16T00:00:00Z");
-  if (new Date() < deadline) {
-    await new Promise(res => setTimeout(res, 1000));
-    const profiles = await sb(`profiles?id=eq.${userId}&select=*`);
-    const profile = Array.isArray(profiles) && profiles[0];
-    if (profile && profile.aprovado) {
-      const authResp = await sbAuth(email, senha);
-      if (authResp.access_token) {
-        setUserToken(authResp.access_token);
-        return { autoLogin: true, profile };
-      }
-    }
+  // 5. Logar automaticamente após cadastro
+  await new Promise(res => setTimeout(res, 800));
+  const authResp = await sbAuth(email, senha);
+  if (authResp.access_token) {
+    setUserToken(authResp.access_token);
+    // Montar perfil localmente para não depender do banco
+    const profile = { id: userId, email, nome, ra, is_admin: isAdmin, aprovado: true };
+    return { autoLogin: true, profile };
   }
+
   return { ok: true };
 }
 
